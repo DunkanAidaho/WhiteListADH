@@ -48,3 +48,8 @@
 @@||itzmx.com^$client='MIBOX.dune.local'
 @@||trahkino.club^$client='LieT-PC.dune.local'
 @@||www.dominik-reichl.de^$important
+@@||push.yandex.ru^$client='Yandex.Station-1e0090.dune.local'
+@@||startup.mobile.yandex.net^$client='yandex-mini2.dune.local'
+@@||push.yandex.ru^$client='yandex-mini2.dune.local'
+@@||push.yandex.ru^$client='185.23.83.133'
+@@||macaddress.io^$important
