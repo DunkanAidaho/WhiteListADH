@@ -25,8 +25,8 @@
 @@||.imgsmail.ru^$client='10.10.24.1'
 @@||xvideos.com^$client='LieT-PC.dune.local'
 @@||static-cdn77.xvideos-cdn.com^$client='LieT-PC.dune.local'
-@@||spr24.net^$client='MITV.dune.local'
-@@||spr24.net^$client='MIBOX.dune.local'
+@@||spr24.net^$important
+@@||reporting.teleportinfra.sh^$important
 @@||lampa.mx^$client='MIBOX.dune.local'
 @@||lampa.mx^$client='MITV.dune.local'
 @@||cub.watch^$client='MIBOX.dune.local'
