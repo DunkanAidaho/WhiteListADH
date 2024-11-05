@@ -1,0 +1,199 @@
+import subprocess
+import json
+import base64
+import struct
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+import os
+
+# Список доменов для фильтрации
+domains = [
+    "youtube.com", "youtube.ru", "ytimg.com", "withyoutube.com", "youtu.be",
+    "youtube-nocookie.com", "yt.be", "youtubemobilesupport.com", "youtubekids.com",
+    "youtubego.com", "youtubegaming.com", "youtubefanfest.com", "youtubeeducation.com",
+    "ggpht.com", "googlevideo.com", "youtube.googleapis.com", "youtubeembeddedplayer.googleapis.com",
+    "youtubei.googleapis.com", "youtube-ui.l.google.com", "wide-youtube.l.google.com",
+    "spankbang.com", "sb-cd.com", "pornhub.com", "xv-ru.com"
+]
+
+days_threshold = 3
+router_ip = '172.16.15.1'
+username = '4youtube'
+ssh_key_path = '~/.ssh/y'
+interface = 'wireguard3'
+log_file_path = '/usr/local/AdGuardHome/data/querylog.json'
+state_file_path = '/tmp/mikrotik_routes_state.json'
+
+def parse_dns_response(data):
+    transaction_id = data[:2]
+    flags = data[2:4]
+    qdcount = struct.unpack('!H', data[4:6])[0]
+    ancount = struct.unpack('!H', data[6:8])[0]
+    
+    offset = 12
+
+    for _ in range(qdcount):
+        offset, qname = parse_name(data, offset)
+        offset += 4
+
+    ip_addresses = []
+    for _ in range(ancount):
+        offset, name = parse_name(data, offset)
+        atype, aclass, ttl, rdlength = struct.unpack('!HHIH', data[offset:offset+10])
+        offset += 10
+        rdata = data[offset:offset+rdlength]
+        offset += rdlength
+        if atype == 1:
+            ip = struct.unpack('!BBBB', rdata)
+            ip_addresses.append(".".join(map(str, ip)))
+    
+    return ip_addresses
+
+def parse_name(data, offset):
+    labels = []
+    while True:
+        length = data[offset]
+        if length & 0xc0 == 0xc0:
+            pointer = struct.unpack('!H', data[offset:offset+2])[0]
+            offset += 2
+            return offset, parse_name(data, pointer & 0x3fff)[1]
+        if length == 0:
+            offset += 1
+            break
+        offset += 1
+        labels.append(data[offset:offset+length].decode('utf-8'))
+        offset += length
+    return offset, ".".join(labels)
+
+def extract_ips(log_file_path):
+    ip_access_times = {}
+    
+    current_time = datetime.now(timezone.utc)
+    threshold_time = current_time - timedelta(days=days_threshold)
+
+    with open(log_file_path, 'r') as log_file:
+        for line in log_file:
+            try:
+                entry = json.loads(line)
+                timestamp_str = entry.get('T', '')
+                timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                
+                if timestamp < threshold_time:
+                    continue
+                
+                if 'QH' in entry and any(domain in entry['QH'] for domain in domains):
+                    encoded_answer = entry.get('Answer', '')
+                    decoded_bytes = base64.b64decode(encoded_answer)
+                    ips = parse_dns_response(decoded_bytes)
+                    
+                    for ip in ips:
+                        if ip != "0.0.0.0":
+                            ip_access_times[ip] = timestamp
+            except (json.JSONDecodeError, KeyError, base64.binascii.Error, ValueError):
+                continue
+    
+    return ip_access_times
+
+def get_current_routes_from_mikrotik():
+    command_get_routes = [
+        "ssh",
+        "-i", ssh_key_path,
+        f"{username}@{router_ip}",
+        "/ip route print detail where comment~\"UUID:\""
+    ]
+    
+    current_routes = {}
+    
+    try:
+        result = subprocess.run(command_get_routes, capture_output=True, text=True, check=True)
+        current_routes_output = result.stdout.strip()
+        
+        for line in current_routes_output.splitlines():
+            if 'dst-address=' in line and 'comment="' in line:
+                parts = line.split()
+                dst_address_part = next(part for part in parts if part.startswith('dst-address='))
+                comment_part = next(part for part in parts if part.startswith('comment="'))
+                
+                dst_address = dst_address_part.split('=')[1].split('/')[0]
+                comment_parts = comment_part.split('"')[1].split(" ")
+                timestamp_str = comment_parts[-2] if len(comment_parts) > 2 else None
+                
+                try:
+                    last_access_time = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S %Z") if timestamp_str else None
+                except ValueError:
+                    last_access_time = None
+                
+                current_routes[dst_address] = last_access_time
+    
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to get current routes: {e}")
+    
+    return current_routes
+
+def load_state():
+    if os.path.exists(state_file_path):
+        with open(state_file_path, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_state(state):
+    with open(state_file_path, 'w') as f:
+        json.dump(state, f)
+
+def update_routes_on_mikrotik(ip_access_times):
+    known_routes = get_current_routes_from_mikrotik()
+    
+    # Загрузка состояния из файла
+    state = load_state()
+    
+    # Обновляем или добавляем маршруты
+    for ip, last_access_time in ip_access_times.items():
+        if ip in known_routes:
+            # Если маршрут существует и дата в логе более новая, обновляем комментарий
+            if known_routes[ip] is None or known_routes[ip] < last_access_time:
+                new_uuid_str = str(uuid.uuid4())
+                comment = f'Loaded from OPNsense {last_access_time.strftime("%Y-%m-%d %H:%M:%S %Z")} UUID: {new_uuid_str}'
+                command_update_comment = [
+                    "ssh",
+                    "-i", ssh_key_path,
+                    f"{username}@{router_ip}",
+                    f'/ip route set [find where dst-address={ip}/32] comment="{comment}"'
+                ]
+                try:
+                    subprocess.run(command_update_comment, check=True)
+                    print(f"Route to {ip} updated successfully with new comment: {comment}")
+                    state[ip] = last_access_time.isoformat()
+                except subprocess.CalledProcessError as e:
+                    print(f"Failed to update route to {ip}: {e}")
+        else:
+            # Если маршрута нет и он не был добавлен ранее, добавляем его с новым UUID
+            if ip not in state or datetime.fromisoformat(state[ip]) < last_access_time:
+                new_uuid_str = str(uuid.uuid4())
+                comment = f'Loaded from OPNsense {last_access_time.strftime("%Y-%m-%d %H:%M:%S %Z")} UUID: {new_uuid_str}'
+                command_add_route = [
+                    "ssh",
+                    "-i", ssh_key_path,
+                    f"{username}@{router_ip}",
+                    f'/ip route add dst-address={ip}/32 gateway={interface} distance=20 scope=40 target-scope=30 comment="{comment}"'
+                ]
+                
+                try:
+                    subprocess.run(command_add_route, check=True)
+                    print(f"Route to {ip} added successfully with comment: {comment}")
+                    state[ip] = last_access_time.isoformat()
+                except subprocess.CalledProcessError as e:
+                    print(f"Failed to add route to {ip}: {e}")
+    
+    # Сохранение состояния в файл
+    save_state(state)
+
+def main():
+    while True:
+        ip_access_times = extract_ips(log_file_path)
+        
+        update_routes_on_mikrotik(ip_access_times)
+        time.sleep(5)
+
+if __name__ == "__main__":
+    main()
